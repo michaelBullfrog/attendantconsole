@@ -1,0 +1,681 @@
+import os
+import json
+import sqlite3
+import requests
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+
+app = FastAPI(title="Webex Calling Supervisor Dashboard")
+
+WEBEX_CLIENT_ID = os.getenv("WEBEX_CLIENT_ID")
+WEBEX_CLIENT_SECRET = os.getenv("WEBEX_CLIENT_SECRET")
+WEBEX_REDIRECT_URI = os.getenv("WEBEX_REDIRECT_URI")
+WEBEX_WEBHOOK_TARGET_URL = os.getenv("WEBEX_WEBHOOK_TARGET_URL")
+
+SCOPES = "spark:calls_read spark:webhooks_write spark:webhooks_read spark:people_read"
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "attendant_console.db"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                person_id TEXT PRIMARY KEY,
+                email TEXT,
+                display_name TEXT,
+                status TEXT NOT NULL DEFAULT 'Not On Call',
+                webex_state TEXT,
+                event_type TEXT,
+                call_id TEXT,
+                call_session_id TEXT,
+                remote_name TEXT,
+                remote_number TEXT,
+                remote_call_type TEXT,
+                state_started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                webhook_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id TEXT,
+                event_type TEXT,
+                webex_state TEXT,
+                call_id TEXT,
+                call_session_id TEXT,
+                payload TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+
+init_db()
+
+
+def classify_status(event: Dict[str, Any]) -> str:
+    """
+    Webex Calling telephony_calls examples:
+      data.state = alerting  -> Ringing
+      data.state = connected -> On Call
+      event = deleted        -> Not On Call
+    """
+    webhook_event = str(event.get("event", "")).lower()
+    data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+    state = str(data.get("state", "")).lower()
+    event_type = str(data.get("eventType", "")).lower()
+
+    if webhook_event == "deleted" or event_type in {"ended", "released", "disconnected"}:
+        return "Not On Call"
+
+    if state in {"alerting", "ringing"} or event_type in {"received", "offered"}:
+        return "Ringing"
+
+    if state in {"connected", "active", "held", "remoteheld", "bridged", "consulting", "conference"} or event_type in {"answered", "connected"}:
+        return "On Call"
+
+    return "Unknown"
+
+
+def extract_remote_party(event: Dict[str, Any]) -> Dict[str, Any]:
+    data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+    remote = data.get("remoteParty", {})
+    return remote if isinstance(remote, dict) else {}
+
+
+def extract_person_id(event: Dict[str, Any]) -> str:
+    """
+    In the sample Webex Calling payload, actorId and createdBy identify the user whose token created the webhook.
+    If Cisco later includes data.personId/email, prefer that first.
+    """
+    data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+    return (
+        data.get("personId")
+        or event.get("actorId")
+        or event.get("createdBy")
+        or event.get("webhookId")
+        or "unknown-person"
+    )
+
+
+def get_me(user_access_token: str) -> Optional[Dict[str, Any]]:
+    response = requests.get(
+        "https://webexapis.com/v1/people/me",
+        headers={"Authorization": f"Bearer {user_access_token}"},
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        print("Unable to call /people/me:", response.text)
+        return None
+    return response.json()
+
+
+def create_call_status_webhook(user_access_token: str) -> Dict[str, Any]:
+    if not WEBEX_WEBHOOK_TARGET_URL:
+        raise HTTPException(status_code=500, detail="Missing WEBEX_WEBHOOK_TARGET_URL")
+
+    payload = {
+        "name": "Supervisor Dashboard - Webex Calling Status",
+        "targetUrl": WEBEX_WEBHOOK_TARGET_URL,
+        "resource": "telephony_calls",
+        "event": "all",
+    }
+
+    response = requests.post(
+        "https://webexapis.com/v1/webhooks",
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {user_access_token}",
+            "Content-Type": "application/json",
+        },
+        timeout=20,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
+
+
+def upsert_agent_from_oauth(me: Dict[str, Any], webhook: Dict[str, Any]):
+    emails = me.get("emails") or []
+    email = emails[0] if emails else None
+    person_id = me.get("id")
+    display_name = me.get("displayName") or email or person_id or "Unknown User"
+
+    if not person_id:
+        return
+
+    ts = now_iso()
+
+    with db() as conn:
+        existing = conn.execute("SELECT person_id FROM agents WHERE person_id = ?", (person_id,)).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE agents
+                SET email = ?, display_name = ?, webhook_id = ?, updated_at = ?
+                WHERE person_id = ?
+            """, (email, display_name, webhook.get("id"), ts, person_id))
+        else:
+            conn.execute("""
+                INSERT INTO agents (
+                    person_id, email, display_name, status, state_started_at, updated_at, webhook_id
+                )
+                VALUES (?, ?, ?, 'Not On Call', ?, ?, ?)
+            """, (person_id, email, display_name, ts, ts, webhook.get("id")))
+
+
+def update_agent_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+    remote = extract_remote_party(event)
+
+    person_id = extract_person_id(event)
+    new_status = classify_status(event)
+
+    webex_state = data.get("state")
+    event_type = data.get("eventType") or event.get("event")
+    call_id = data.get("callId")
+    call_session_id = data.get("callSessionId")
+
+    if new_status == "Not On Call":
+        call_id = None
+        call_session_id = None
+        remote_name = None
+        remote_number = None
+        remote_call_type = None
+    else:
+        remote_name = remote.get("name")
+        remote_number = remote.get("number")
+        remote_call_type = remote.get("callType")
+
+    ts = now_iso()
+
+    with db() as conn:
+        existing = conn.execute("SELECT * FROM agents WHERE person_id = ?", (person_id,)).fetchone()
+
+        if existing:
+            state_started_at = existing["state_started_at"] if existing["status"] == new_status else ts
+            email = existing["email"]
+            display_name = existing["display_name"] or email or person_id
+            webhook_id = event.get("id") or existing["webhook_id"]
+
+            conn.execute("""
+                UPDATE agents
+                SET status = ?, webex_state = ?, event_type = ?, call_id = ?, call_session_id = ?,
+                    remote_name = ?, remote_number = ?, remote_call_type = ?,
+                    state_started_at = ?, updated_at = ?, webhook_id = ?
+                WHERE person_id = ?
+            """, (
+                new_status, webex_state, event_type, call_id, call_session_id,
+                remote_name, remote_number, remote_call_type,
+                state_started_at, ts, webhook_id, person_id
+            ))
+        else:
+            # This can happen if a webhook event arrives before the OAuth user was stored.
+            state_started_at = ts
+            email = person_id
+            display_name = person_id
+            webhook_id = event.get("id")
+
+            conn.execute("""
+                INSERT INTO agents (
+                    person_id, email, display_name, status, webex_state, event_type,
+                    call_id, call_session_id, remote_name, remote_number, remote_call_type,
+                    state_started_at, updated_at, webhook_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                person_id, email, display_name, new_status, webex_state, event_type,
+                call_id, call_session_id, remote_name, remote_number, remote_call_type,
+                state_started_at, ts, webhook_id
+            ))
+
+        conn.execute("""
+            INSERT INTO events (
+                person_id, event_type, webex_state, call_id, call_session_id, payload, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            person_id, event_type, webex_state, data.get("callId"), data.get("callSessionId"),
+            json.dumps(event), ts
+        ))
+
+        row = conn.execute("SELECT * FROM agents WHERE person_id = ?", (person_id,)).fetchone()
+        return dict(row)
+
+
+@app.get("/")
+def root():
+    return RedirectResponse("/supervisor")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "database": str(DB_PATH)}
+
+
+@app.get("/supervisor", response_class=HTMLResponse)
+def supervisor_dashboard():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Webex Calling Supervisor Dashboard</title>
+  <style>
+    :root {
+      --bg: #eef3f8;
+      --panel: #ffffff;
+      --text: #101828;
+      --muted: #667085;
+      --border: #d0d5dd;
+      --blue: #2563eb;
+      --dark: #0f172a;
+      --green-bg: #dcfce7;
+      --green-text: #166534;
+      --red-bg: #fee2e2;
+      --red-text: #991b1b;
+      --yellow-bg: #fef3c7;
+      --yellow-text: #92400e;
+      --gray-bg: #e5e7eb;
+      --gray-text: #374151;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      background: linear-gradient(135deg, #0f172a, #1e293b);
+      color: white;
+      padding: 24px 30px;
+    }
+    header h1 { margin: 0; font-size: 26px; }
+    header p { margin: 7px 0 0; color: #cbd5e1; font-size: 14px; }
+    main { max-width: 1500px; margin: 0 auto; padding: 22px; }
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .toolbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    input, select {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      min-width: 240px;
+      background: white;
+    }
+    button, a.button {
+      border: none;
+      border-radius: 10px;
+      background: var(--blue);
+      color: white;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    button.secondary { background: #475569; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .summary-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+    }
+    .summary-card .label { color: var(--muted); font-size: 13px; }
+    .summary-card .value { font-size: 30px; font-weight: 800; margin-top: 4px; }
+    .table-wrap {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    thead { background: #f8fafc; }
+    th {
+      text-align: left;
+      padding: 13px 14px;
+      color: #475569;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td { padding: 13px 14px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: #f8fafc; }
+    .email { font-weight: 800; color: #0f172a; word-break: break-word; }
+    .subtext { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 7px 11px;
+      font-weight: 800;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .Ringing { background: var(--yellow-bg); color: var(--yellow-text); }
+    .OnCall { background: var(--red-bg); color: var(--red-text); }
+    .NotOnCall { background: var(--green-bg); color: var(--green-text); }
+    .Unknown { background: var(--gray-bg); color: var(--gray-text); }
+    .duration { font-weight: 800; color: #0f172a; white-space: nowrap; }
+    .empty { padding: 36px; text-align: center; color: var(--muted); }
+    .note { margin-top: 14px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 900px) {
+      main { padding: 14px; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      .table-wrap { overflow-x: auto; }
+      table { min-width: 1150px; }
+      input, select, button, a.button { width: 100%; }
+      .toolbar, .toolbar-left { width: 100%; align-items: stretch; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Webex Calling Supervisor Dashboard</h1>
+  <p>Monitor connected Webex Calling users by current state and duration.</p>
+</header>
+
+<main>
+  <div class="toolbar">
+    <div class="toolbar-left">
+      <input id="search" placeholder="Search email, name, number, state..." oninput="renderTable()" />
+      <select id="stateFilter" onchange="renderTable()">
+        <option value="All">All States</option>
+        <option value="Ringing">Ringing</option>
+        <option value="On Call">On Call</option>
+        <option value="Not On Call">Not On Call</option>
+        <option value="Unknown">Unknown</option>
+      </select>
+      <button onclick="loadAgents()">Refresh</button>
+      <button class="secondary" onclick="resetAgents()">Reset</button>
+    </div>
+    <a class="button" href="/oauth/start">Connect Webex User</a>
+  </div>
+
+  <section class="summary">
+    <div class="summary-card"><div class="label">Total Users</div><div class="value" id="totalCount">0</div></div>
+    <div class="summary-card"><div class="label">Ringing</div><div class="value" id="ringingCount">0</div></div>
+    <div class="summary-card"><div class="label">On Call</div><div class="value" id="onCallCount">0</div></div>
+    <div class="summary-card"><div class="label">Not On Call</div><div class="value" id="notOnCallCount">0</div></div>
+  </section>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>User Email</th>
+          <th>State</th>
+          <th>Time in State</th>
+          <th>Display Name</th>
+          <th>Webex State</th>
+          <th>Event Type</th>
+          <th>Remote Party</th>
+          <th>Remote Number</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody id="agentBody">
+        <tr><td colspan="9" class="empty">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    Dashboard refreshes every 3 seconds. Duration updates every second. User records persist in SQLite while the Render filesystem is available; for production, use Render PostgreSQL.
+  </div>
+</main>
+
+<script>
+let agents = [];
+
+function cssStatus(status) {
+  if (status === "On Call") return "OnCall";
+  if (status === "Not On Call") return "NotOnCall";
+  if (status === "Ringing") return "Ringing";
+  return "Unknown";
+}
+
+function fmtDate(value) {
+  if (!value) return "N/A";
+  try { return new Date(value).toLocaleString(); } catch { return value; }
+}
+
+function durationSince(value) {
+  if (!value) return "N/A";
+  const start = new Date(value).getTime();
+  if (Number.isNaN(start)) return "N/A";
+  const secondsTotal = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  const h = Math.floor(secondsTotal / 3600);
+  const m = Math.floor((secondsTotal % 3600) / 60);
+  const s = secondsTotal % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+async function loadAgents() {
+  try {
+    const res = await fetch("/api/agents", { cache: "no-store" });
+    const data = await res.json();
+    agents = data.agents || [];
+    renderTable();
+  } catch (err) {
+    console.error(err);
+    document.getElementById("agentBody").innerHTML =
+      `<tr><td colspan="9" class="empty">Could not load /api/agents. Check Render logs.</td></tr>`;
+  }
+}
+
+function renderSummary() {
+  document.getElementById("totalCount").textContent = agents.length;
+  document.getElementById("ringingCount").textContent = agents.filter(a => a.status === "Ringing").length;
+  document.getElementById("onCallCount").textContent = agents.filter(a => a.status === "On Call").length;
+  document.getElementById("notOnCallCount").textContent = agents.filter(a => a.status === "Not On Call").length;
+}
+
+function renderTable() {
+  renderSummary();
+  const search = document.getElementById("search").value.toLowerCase().trim();
+  const filter = document.getElementById("stateFilter").value;
+
+  const filtered = agents.filter(a => {
+    const matchesState = filter === "All" || a.status === filter;
+    const blob = JSON.stringify(a).toLowerCase();
+    return matchesState && blob.includes(search);
+  });
+
+  const body = document.getElementById("agentBody");
+  if (!filtered.length) {
+    body.innerHTML = `<tr><td colspan="9" class="empty">No agents found. Click Connect Webex User, authorize a user, then make/receive a test call.</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = filtered.map(a => `
+    <tr>
+      <td>
+        <div class="email">${a.email || a.person_id || "Unknown"}</div>
+        <div class="subtext">${a.person_id || ""}</div>
+      </td>
+      <td><span class="pill ${cssStatus(a.status)}">${a.status || "Unknown"}</span></td>
+      <td><span class="duration">${durationSince(a.state_started_at || a.updated_at)}</span></td>
+      <td>${a.display_name || "N/A"}</td>
+      <td>${a.webex_state || "N/A"}</td>
+      <td>${a.event_type || "N/A"}</td>
+      <td>${a.remote_name || "N/A"}</td>
+      <td>${a.remote_number || "N/A"}</td>
+      <td>
+        <div>${fmtDate(a.updated_at)}</div>
+        <div class="subtext">${a.call_session_id || ""}</div>
+      </td>
+    </tr>
+  `).join("");
+}
+
+async function resetAgents() {
+  await fetch("/api/reset", { method: "POST" });
+  await loadAgents();
+}
+
+loadAgents();
+setInterval(loadAgents, 3000);
+setInterval(renderTable, 1000);
+</script>
+</body>
+</html>
+    """)
+
+
+@app.get("/api/agents")
+def api_agents():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM agents").fetchall()
+
+    agents = [dict(row) for row in rows]
+    priority = {"Ringing": 0, "On Call": 1, "Unknown": 2, "Not On Call": 3}
+    agents.sort(key=lambda a: (priority.get(a.get("status"), 9), a.get("email") or a.get("display_name") or ""))
+
+    return {"count": len(agents), "agents": agents}
+
+
+@app.get("/api/events")
+def api_events(limit: int = 50):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, person_id, event_type, webex_state, call_id, call_session_id, created_at
+            FROM events
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return {"events": [dict(row) for row in rows]}
+
+
+@app.post("/api/reset")
+def api_reset():
+    with db() as conn:
+        conn.execute("DELETE FROM agents")
+        conn.execute("DELETE FROM events")
+    return {"message": "reset complete"}
+
+
+@app.get("/oauth/start")
+def oauth_start():
+    if not WEBEX_CLIENT_ID or not WEBEX_REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="Missing WEBEX_CLIENT_ID or WEBEX_REDIRECT_URI")
+
+    auth_url = (
+        "https://webexapis.com/v1/authorize"
+        f"?client_id={WEBEX_CLIENT_ID}"
+        "&response_type=code"
+        f"&redirect_uri={WEBEX_REDIRECT_URI}"
+        f"&scope={SCOPES.replace(' ', '%20')}"
+        "&state=webex-calling-supervisor-dashboard"
+    )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/oauth/callback")
+def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
+    if not WEBEX_CLIENT_ID or not WEBEX_CLIENT_SECRET or not WEBEX_REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="Missing Webex OAuth environment variables")
+
+    token_response = requests.post(
+        "https://webexapis.com/v1/access_token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": WEBEX_CLIENT_ID,
+            "client_secret": WEBEX_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": WEBEX_REDIRECT_URI,
+        },
+        timeout=20,
+    )
+
+    if token_response.status_code >= 400:
+        raise HTTPException(status_code=token_response.status_code, detail=token_response.text)
+
+    tokens = token_response.json()
+    access_token = tokens.get("access_token")
+
+    me = get_me(access_token)
+    webhook = create_call_status_webhook(access_token)
+
+    if me:
+        upsert_agent_from_oauth(me, webhook)
+
+    return HTMLResponse(f"""
+    <html>
+      <head>
+        <title>Webex User Connected</title>
+        <meta http-equiv="refresh" content="2; url=/supervisor" />
+        <style>
+          body {{ font-family: Arial, sans-serif; background: #eef3f8; padding: 40px; }}
+          .card {{ background: white; padding: 24px; border-radius: 16px; max-width: 720px; box-shadow: 0 8px 18px rgba(15,23,42,.08); }}
+          a {{ color: #2563eb; }}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Webex user connected</h2>
+          <p>The user was added to the supervisor dashboard and a <strong>telephony_calls</strong> webhook was created.</p>
+          <p><strong>Webhook ID:</strong> {webhook.get("id")}</p>
+          <p><a href="/supervisor">Open Supervisor Dashboard</a></p>
+        </div>
+      </body>
+    </html>
+    """)
+
+
+@app.post("/webex/calling-events")
+async def calling_events(request: Request):
+    event = await request.json()
+
+    print("Received Webex Calling event:")
+    print(json.dumps(event, indent=2))
+
+    agent = update_agent_from_event(event)
+
+    return {"status": "received", "agent": agent}
