@@ -31,7 +31,7 @@ try:
 except Exception:
     WEBEX_ORG_NAME_MAP = {}
 
-SCOPES = "spark:calls_read spark:webhooks_write spark:webhooks_read spark:people_read spark-admin:organizations_read"
+SCOPES = "spark:calls_read spark:webhooks_write spark:webhooks_read spark:people_read spark-admin:organizations_read spark-admin:people_read"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(exist_ok=True)
